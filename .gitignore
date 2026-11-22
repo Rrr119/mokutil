@@ -71,3 +71,7 @@
 /src/*.swp
 /stamp-h1
 /tags
+/test-driver
+/tests/Makefile
+/tests/Makefile.in
+/tests/policy_test.tmp

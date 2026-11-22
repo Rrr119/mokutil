@@ -1,1 +1,28 @@
-The utility to manipulate machines owner keys which managed in shim
+The utility to manipulate machine owner keys which are managed in shim.
+
+Policy-controlled MOK management is available without changing the existing
+command line:
+
+* `--policy <file>` applies import, delete, revoke, and reset rules from a
+  versioned policy file. `MOKUTIL_POLICY` and `/etc/mokutil/policy.conf` are
+  discovered when `--policy` is not supplied. If no policy exists, legacy
+  behavior is retained.
+* `--policy-check <file>` validates a policy without touching EFI variables.
+* `--import-list <manifest>` imports a batch from a manifest. Relative paths
+  are resolved from the manifest directory, comments are ignored, and
+  directories expand to their regular files. The batch is validated in full
+  before a MOK request is written.
+* Existing `--import`, `--delete`, `--import-hash`, `--delete-hash`,
+  `--revoke-import`, and `--revoke-delete` options keep their original syntax.
+
+See `man/mokutil.1` for the policy grammar and examples.
+
+Run the five configuration tests with:
+
+```
+make check
+```
+
+Covered configurations are legacy/no-policy compatibility, allowed batch
+import, deny rules (fingerprint, path, batch size, and CA requirement),
+revoke policy, and malformed policy rejection.

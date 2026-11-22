@@ -31,7 +31,9 @@
  */
 #include <dirent.h>
 #include <errno.h>
+#include <limits.h>
 #include <stdio.h>
+#include <stdint.h>
 #include <stdlib.h>
 #include <string.h>
 #include <strings.h>
@@ -49,8 +51,10 @@
 #include "signature.h"
 #include "efi_hash.h"
 #include "efi_x509.h"
+#include "filelist.h"
 #include "keyring.h"
 #include "password-crypt.h"
+#include "policy.h"
 #include "util.h"
 
 #define PASSWORD_MAX 256
@@ -88,11 +92,13 @@
 #define TRUST_MOK          (1 << 27)
 #define UNTRUST_MOK        (1 << 28)
 #define SET_SBAT           (1 << 29)
+#define POLICY_CHECK       (1 << 30)
 
 #define DEFAULT_CRYPT_METHOD SHA512_BASED
 #define DEFAULT_SALT_SIZE    SHA512_SALT_MAX
 #define SETTINGS_LEN         (DEFAULT_SALT_SIZE*2)
 #define BUF_SIZE             300
+#define DEFAULT_POLICY_PATH  "/etc/mokutil/policy.conf"
 
 static int force_ca_check;
 static int check_keyring;
@@ -115,6 +121,7 @@ print_help ()
 	printf ("  --list-new\t\t\t\tList the keys to be enrolled\n");
 	printf ("  --list-delete\t\t\t\tList the keys to be deleted\n");
 	printf ("  --import <der file...>\t\tImport keys\n");
+	printf ("  --import-list <manifest>\t\tImport keys listed in a manifest\n");
 	printf ("  --delete <der file...>\t\tDelete specific keys\n");
 	printf ("  --revoke-import\t\t\tRevoke the import request\n");
 	printf ("  --revoke-delete\t\t\tRevoke the delete request\n");
@@ -150,6 +157,9 @@ print_help ()
 	printf ("  --mokx\t\t\t\tManipulate the MOK blacklist\n");
 	printf ("  --ca-check\t\t\t\tCheck if CA of the key is enrolled/blocked\n");
 	printf ("  --ignore-keyring\t\t\tDon't check if the key is the kernel keyring\n");
+	printf ("  --policy <policy file>\t\tApply an import/revoke policy\n");
+	printf ("  --no-policy\t\t\t\tDisable policy discovery\n");
+	printf ("  --policy-check <file>\t\t\tValidate a policy file and exit\n");
 }
 
 static int
@@ -828,9 +838,35 @@ print_skip_message (const char *filename, const void *mok,
 	}
 }
 
+static MokPolicyOperation
+policy_operation_for_request(const MokRequest req)
+{
+	switch (req) {
+	case ENROLL_MOK:
+		return MOK_POLICY_IMPORT;
+	case DELETE_MOK:
+		return MOK_POLICY_DELETE;
+	case ENROLL_BLACKLIST:
+		return MOK_POLICY_IMPORT;
+	case DELETE_BLACKLIST:
+		return MOK_POLICY_DELETE;
+	}
+
+	return MOK_POLICY_IMPORT;
+}
+
 static int
-issue_mok_request (char **files, const uint32_t total, const MokRequest req,
-		   const char *pw_hash_file, const int root_pw)
+print_policy_error(const MokPolicy *policy, const char *operation)
+{
+	fprintf (stderr, "MOK policy rejected %s: %s\n", operation,
+		 mok_policy_error (policy));
+	return -1;
+}
+
+static int
+issue_mok_request (MokPolicy *policy, char **files, const uint32_t total,
+		   const MokRequest req, const char *pw_hash_file,
+		   const int root_pw)
 {
 	uint8_t *old_req_data = NULL;
 	size_t old_req_data_size = 0;
@@ -847,9 +883,16 @@ issue_mok_request (char **files, const uint32_t total, const MokRequest req,
 	EFI_SIGNATURE_LIST *CertList;
 	EFI_SIGNATURE_DATA *CertData;
 	const char *var_name = get_req_var_name (req);
+	MokPolicyOperation policy_op = policy_operation_for_request (req);
 
 	if (!files)
 		return -1;
+
+	if (mok_policy_check_operation (policy, policy_op) < 0)
+		return print_policy_error (policy, mok_policy_operation_name (policy_op));
+
+	if (mok_policy_check_batch (policy, policy_op, files, total) < 0)
+		return print_policy_error (policy, "batch");
 
 	sizes = malloc (total * sizeof(uint32_t));
 	if (!sizes) {
@@ -931,6 +974,13 @@ issue_mok_request (char **files, const uint32_t total, const MokRequest req,
 			goto error;
 		}
 
+		if (mok_policy_check_cert (policy, policy_op, files[i], mok,
+					   mok_size) < 0) {
+			close (fd);
+			print_policy_error (policy, files[i]);
+			goto error;
+		}
+
 		/* Check whether the key is already in the trusted keyring */
 		if (req == ENROLL_MOK && check_keyring &&
 		    is_in_trusted_keyring (mok, mok_size)) {
@@ -950,6 +1000,15 @@ issue_mok_request (char **files, const uint32_t total, const MokRequest req,
 		/* Check whether CA is blocked */
 		if (force_ca_check && is_ca_blocked (mok, mok_size, req)) {
 			printf ("CA blocked. Skip %s\n", files[i]);
+			close (fd);
+			continue;
+		}
+
+		if (real_size > 0 &&
+		    is_one_duplicate (&efi_guid_x509_cert, mok, mok_size,
+				      new_list, real_size)) {
+			printf ("%s is duplicated in this batch\n", files[i]);
+			ptr -= sizeof(EFI_SIGNATURE_LIST) + sizeof(efi_guid_t);
 			close (fd);
 			continue;
 		}
@@ -1016,7 +1075,7 @@ hex_str_to_binary (const char *hex_str, uint8_t *array, const unsigned int len)
 }
 
 static int
-issue_hash_request (const char *hash_str, const MokRequest req,
+issue_hash_request (MokPolicy *policy, const char *hash_str, const MokRequest req,
 		    const char *pw_hash_file, const int root_pw)
 {
 	uint8_t *old_req_data = NULL;
@@ -1036,9 +1095,16 @@ issue_hash_request (const char *hash_str, const MokRequest req,
 	MokListNode *mok_list = NULL;
 	uint32_t mok_num;
 	const char *var_name = get_req_var_name (req);
+	MokPolicyOperation policy_op = policy_operation_for_request (req);
 
 	if (!hash_str)
 		return -1;
+
+	if (mok_policy_check_operation (policy, policy_op) < 0)
+		return print_policy_error (policy, mok_policy_operation_name (policy_op));
+
+	if (mok_policy_check_hash (policy, policy_op, hash_str) < 0)
+		return print_policy_error (policy, "hash");
 
 	hash_size = identify_hash_type (hash_str, &hash_type);
 	if (hash_size < 0)
@@ -1159,8 +1225,23 @@ error:
 }
 
 static int
-revoke_request (const MokRequest req)
+revoke_request (MokPolicy *policy, const MokRequest req)
 {
+	MokPolicyOperation policy_op;
+
+	if (req == ENROLL_MOK)
+		policy_op = MOK_POLICY_REVOKE_IMPORT;
+	else if (req == DELETE_MOK)
+		policy_op = MOK_POLICY_REVOKE_DELETE;
+	else if (req == ENROLL_BLACKLIST)
+		policy_op = MOK_POLICY_REVOKE_IMPORT;
+	else
+		policy_op = MOK_POLICY_REVOKE_DELETE;
+
+	if (mok_policy_check_operation (policy, policy_op) < 0)
+		return print_policy_error (policy,
+					   mok_policy_operation_name (policy_op));
+
 	if (test_and_delete_mok_var (get_req_var_name(req)) < 0)
 		return -1;
 	if (test_and_delete_mok_var (get_req_auth_var_name(req)) < 0)
@@ -1553,8 +1634,13 @@ error:
 }
 
 static int
-reset_moks (const MokRequest req, const char *pw_hash_file, const int root_pw)
+reset_moks (MokPolicy *policy, const MokRequest req, const char *pw_hash_file,
+	    const int root_pw)
 {
+	if (mok_policy_check_operation (policy, MOK_POLICY_RESET) < 0)
+		return print_policy_error (policy,
+					   mok_policy_operation_name (MOK_POLICY_RESET));
+
 	if (update_request (NULL, 0, req, pw_hash_file, root_pw)) {
 		fprintf (stderr, "Failed to issue a reset request\n");
 		return -1;
@@ -1775,6 +1861,61 @@ manage_sbat (const uint8_t sbat_policy)
 	return 0;
 }
 
+static const char *
+select_policy_path(const char *explicit_path, int no_policy)
+{
+	const char *environment_path;
+
+	if (no_policy)
+		return NULL;
+	if (explicit_path)
+		return explicit_path;
+
+	environment_path = getenv ("MOKUTIL_POLICY");
+	if (environment_path && *environment_path)
+		return environment_path;
+
+	if (access (DEFAULT_POLICY_PATH, F_OK) == 0)
+		return DEFAULT_POLICY_PATH;
+
+	return NULL;
+}
+
+static int
+policy_operation_for_command(unsigned int command, MokPolicyOperation *op)
+{
+	if (command & IMPORT) {
+		*op = MOK_POLICY_IMPORT;
+		return 1;
+	}
+	if (command & DELETE) {
+		*op = MOK_POLICY_DELETE;
+		return 1;
+	}
+	if (command & IMPORT_HASH) {
+		*op = MOK_POLICY_IMPORT;
+		return 1;
+	}
+	if (command & DELETE_HASH) {
+		*op = MOK_POLICY_DELETE;
+		return 1;
+	}
+	if (command & REVOKE_IMPORT) {
+		*op = MOK_POLICY_REVOKE_IMPORT;
+		return 1;
+	}
+	if (command & REVOKE_DELETE) {
+		*op = MOK_POLICY_REVOKE_DELETE;
+		return 1;
+	}
+	if (command & RESET) {
+		*op = MOK_POLICY_RESET;
+		return 1;
+	}
+
+	return 0;
+}
+
 int
 main (int argc, char *argv[])
 {
@@ -1784,15 +1925,21 @@ main (int argc, char *argv[])
 	char *input_pw = NULL;
 	char *hash_str = NULL;
 	char *timeout = NULL;
+	char *policy_path = NULL;
+	char *manifest_file = NULL;
+	char *policy_error = NULL;
 	const char *option;
 	int c, i, f_ind, total = 0;
+	size_t manifest_count = 0;
 	unsigned int command = 0;
 	int use_root_pw = 0;
+	int no_policy = 0;
 	uint8_t verbosity = 0;
 	uint8_t fb_verbosity = 0;
 	uint8_t fb_noreboot = 0;
 	uint8_t sbat_policy = 0;
 	DBName db_name = MOK_LIST_RT;
+	MokPolicy *policy = NULL;
 	int ret = -1;
 	int sb_check;
 
@@ -1806,6 +1953,9 @@ main (int argc, char *argv[])
 			{"list-new",	       no_argument,       0, 'N'},
 			{"list-delete",	       no_argument,       0, 'D'},
 			{"import",             required_argument, 0, 'i'},
+			{"import-list",        required_argument, 0, 0  },
+			{"batch-import",       required_argument, 0, 0  },
+			{"import-manifest",    required_argument, 0, 0  },
 			{"delete",             required_argument, 0, 'd'},
 			{"revoke-import",      no_argument,       0, 0  },
 			{"revoke-delete",      no_argument,       0, 0  },
@@ -1841,6 +1991,9 @@ main (int argc, char *argv[])
 			{"timeout",            required_argument, 0, 0  },
 			{"ca-check",           no_argument,       0, 0  },
 			{"ignore-keyring",     no_argument,       0, 0  },
+			{"policy",             required_argument, 0, 0  },
+			{"no-policy",          no_argument,       0, 0  },
+			{"policy-check",       required_argument, 0, 0  },
 			{"version",            no_argument,       0, 'v'},
 			{0, 0, 0, 0}
 		};
@@ -1966,6 +2119,42 @@ main (int argc, char *argv[])
 				force_ca_check = 1;
 			} else if (strcmp (option, "ignore-keyring") == 0) {
 				check_keyring = 0;
+			} else if (strcmp (option, "import-list") == 0 ||
+				   strcmp (option, "batch-import") == 0 ||
+				   strcmp (option, "import-manifest") == 0) {
+				if (manifest_file) {
+					command |= HELP;
+					break;
+				}
+				manifest_file = strdup (optarg);
+				if (!manifest_file) {
+					fprintf (stderr, "Could not allocate space: %m\n");
+					exit (1);
+				}
+				command |= IMPORT;
+			} else if (strcmp (option, "policy") == 0) {
+				if (policy_path) {
+					command |= HELP;
+					break;
+				}
+				policy_path = strdup (optarg);
+				if (!policy_path) {
+					fprintf (stderr, "Could not allocate space: %m\n");
+					exit (1);
+				}
+			} else if (strcmp (option, "no-policy") == 0) {
+				no_policy = 1;
+			} else if (strcmp (option, "policy-check") == 0) {
+				if (policy_path) {
+					command |= HELP;
+					break;
+				}
+				policy_path = strdup (optarg);
+				if (!policy_path) {
+					fprintf (stderr, "Could not allocate space: %m\n");
+					exit (1);
+				}
+				command |= POLICY_CHECK;
 			}
 
 			break;
@@ -2091,6 +2280,15 @@ main (int argc, char *argv[])
 	if (pw_hash_file && use_root_pw)
 		command |= HELP;
 
+	if (policy_path && no_policy)
+		command |= HELP;
+
+	if ((command & POLICY_CHECK) && command != POLICY_CHECK)
+		command |= HELP;
+
+	if (manifest_file && (command & ~MOKX) != IMPORT)
+		command |= HELP;
+
 	if (db_name != MOK_LIST_RT && !(command & ~MOKX))
 		command |= LIST_ENROLLED;
 
@@ -2101,6 +2299,74 @@ main (int argc, char *argv[])
 		print_help ();
 		ret = 0;
 		goto out;
+	}
+
+	const char *selected_policy = select_policy_path (policy_path, no_policy);
+	unsigned int policy_commands = IMPORT | DELETE | IMPORT_HASH |
+				       DELETE_HASH | REVOKE_IMPORT |
+				       REVOKE_DELETE | RESET;
+
+	if (command == POLICY_CHECK && !selected_policy) {
+		fprintf (stderr, "No policy file specified for --policy-check\n");
+		ret = -1;
+		goto out;
+	}
+
+	if (command == POLICY_CHECK || selected_policy ||
+	    (command & policy_commands)) {
+		policy = mok_policy_load (selected_policy, &policy_error);
+		if (!policy) {
+			fprintf (stderr, "Invalid MOK policy%s%s: %s\n",
+				 selected_policy ? " " : "",
+				 selected_policy ? selected_policy : "",
+				 policy_error ? policy_error : "unknown error");
+			free (policy_error);
+			policy_error = NULL;
+			ret = -1;
+			goto out;
+		}
+	} else {
+		policy = mok_policy_load (NULL, NULL);
+	}
+
+	if (command == POLICY_CHECK) {
+		printf ("Policy file %s is valid\n", selected_policy);
+		mok_policy_print (policy, stdout);
+		ret = 0;
+		goto out;
+	}
+
+	MokPolicyOperation requested_operation;
+	if (policy_operation_for_command (command, &requested_operation) &&
+	    mok_policy_check_operation (policy, requested_operation) < 0) {
+		print_policy_error (policy,
+				    mok_policy_operation_name (requested_operation));
+		ret = -1;
+		goto out;
+	}
+
+	if (manifest_file) {
+		if (files) {
+			fprintf (stderr,
+				 "--import and --import-list cannot be used together\n");
+			ret = -1;
+			goto out;
+		}
+		if (mok_file_list_load (manifest_file, &files, &manifest_count,
+					&policy_error) < 0) {
+			fprintf (stderr, "Failed to read import list: %s\n",
+				 policy_error ? policy_error : "unknown error");
+			free (policy_error);
+			policy_error = NULL;
+			ret = -1;
+			goto out;
+		}
+		if (manifest_count > INT_MAX) {
+			fprintf (stderr, "Too many files in import list\n");
+			ret = -1;
+			goto out;
+		}
+		total = (int)manifest_count;
 	}
 
 	/* check if mock is supported on the system */
@@ -2141,26 +2407,26 @@ main (int argc, char *argv[])
 			ret = list_keys_in_var ("MokDel", efi_guid_shim);
 			break;
 		case IMPORT:
-			ret = issue_mok_request (files, total, ENROLL_MOK,
+			ret = issue_mok_request (policy, files, total, ENROLL_MOK,
 						 pw_hash_file, use_root_pw);
 			break;
 		case DELETE:
-			ret = issue_mok_request (files, total, DELETE_MOK,
+			ret = issue_mok_request (policy, files, total, DELETE_MOK,
 						 pw_hash_file, use_root_pw);
 			break;
 		case IMPORT_HASH:
-			ret = issue_hash_request (hash_str, ENROLL_MOK,
+			ret = issue_hash_request (policy, hash_str, ENROLL_MOK,
 						  pw_hash_file, use_root_pw);
 			break;
 		case DELETE_HASH:
-			ret = issue_hash_request (hash_str, DELETE_MOK,
+			ret = issue_hash_request (policy, hash_str, DELETE_MOK,
 						  pw_hash_file, use_root_pw);
 			break;
 		case REVOKE_IMPORT:
-			ret = revoke_request (ENROLL_MOK);
+			ret = revoke_request (policy, ENROLL_MOK);
 			break;
 		case REVOKE_DELETE:
-			ret = revoke_request (DELETE_MOK);
+			ret = revoke_request (policy, DELETE_MOK);
 			break;
 		case EXPORT:
 		case EXPORT | MOKX:
@@ -2185,7 +2451,8 @@ main (int argc, char *argv[])
 			ret = test_key (ENROLL_MOK, key_file);
 			break;
 		case RESET:
-			ret = reset_moks (ENROLL_MOK, pw_hash_file, use_root_pw);
+			ret = reset_moks (policy, ENROLL_MOK, pw_hash_file,
+					  use_root_pw);
 			break;
 		case GENERATE_PW_HASH:
 			ret = generate_pw_hash (input_pw);
@@ -2209,29 +2476,34 @@ main (int argc, char *argv[])
 			ret = list_keys_in_var ("MokXDel", efi_guid_shim);
 			break;
 		case IMPORT | MOKX:
-			ret = issue_mok_request (files, total, ENROLL_BLACKLIST,
+			ret = issue_mok_request (policy, files, total,
+						 ENROLL_BLACKLIST,
 						 pw_hash_file, use_root_pw);
 			break;
 		case DELETE | MOKX:
-			ret = issue_mok_request (files, total, DELETE_BLACKLIST,
+			ret = issue_mok_request (policy, files, total,
+						 DELETE_BLACKLIST,
 						 pw_hash_file, use_root_pw);
 			break;
 		case IMPORT_HASH | MOKX:
-			ret = issue_hash_request (hash_str, ENROLL_BLACKLIST,
+			ret = issue_hash_request (policy, hash_str,
+						  ENROLL_BLACKLIST,
 						  pw_hash_file, use_root_pw);
 			break;
 		case DELETE_HASH | MOKX:
-			ret = issue_hash_request (hash_str, DELETE_BLACKLIST,
+			ret = issue_hash_request (policy, hash_str,
+						  DELETE_BLACKLIST,
 						  pw_hash_file, use_root_pw);
 			break;
 		case REVOKE_IMPORT | MOKX:
-			ret = revoke_request (ENROLL_BLACKLIST);
+			ret = revoke_request (policy, ENROLL_BLACKLIST);
 			break;
 		case REVOKE_DELETE | MOKX:
-			ret = revoke_request (DELETE_BLACKLIST);
+			ret = revoke_request (policy, DELETE_BLACKLIST);
 			break;
 		case RESET | MOKX:
-			ret = reset_moks (ENROLL_BLACKLIST, pw_hash_file, use_root_pw);
+			ret = reset_moks (policy, ENROLL_BLACKLIST, pw_hash_file,
+					  use_root_pw);
 			break;
 		case TEST_KEY | MOKX:
 			ret = test_key (ENROLL_BLACKLIST, key_file);
@@ -2280,6 +2552,18 @@ out:
 
 	if (hash_str)
 		free (hash_str);
+
+	if (policy)
+		mok_policy_free (policy);
+
+	if (policy_path)
+		free (policy_path);
+
+	if (manifest_file)
+		free (manifest_file);
+
+	if (policy_error)
+		free (policy_error);
 
 	return ret;
 }

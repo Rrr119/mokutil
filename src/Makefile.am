@@ -16,10 +16,14 @@ mokutil_SOURCES = signature.h \
 		  efi_hash.c \
 		  efi_x509.h \
 		  efi_x509.c \
+		  filelist.h \
+		  filelist.c \
 		  keyring.h \
 		  keyring.c \
 		  password-crypt.h \
 		  password-crypt.c \
+		  policy.h \
+		  policy.c \
 		  util.h \
 		  util.c \
 		  mokutil.h \

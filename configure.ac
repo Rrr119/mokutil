@@ -106,5 +106,6 @@ AM_CONDITIONAL([ENABLE_BASH_COMPLETION],[test "x$with_bash_completion_dir" != "x
 
 AC_CONFIG_FILES([Makefile
                  src/Makefile
-		 man/Makefile])
+		 man/Makefile
+		 tests/Makefile])
 AC_OUTPUT

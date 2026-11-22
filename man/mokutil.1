@@ -17,9 +17,12 @@ mokutil \- utility to manipulate machine owner keys
         ([--hash-file \fIhashfile\fR | -f \fIhashfile\fR] | [--root-pw | -P] |
          [--mokx | -X] | [--ca-check] | [--ignore-keyring])
 .br
+\fBmokutil\fR [--import-list \fImanifest\fR]
+        ([--policy \fIpolicyfile\fR] | [--no-policy])
+.br
 \fBmokutil\fR [--delete \fIkeylist\fR | -d \fIkeylist\fR]
         ([--hash-file \fIhashfile\fR | -f \fIhashfile\fR] | [--root-pw | -P] |
-         [--mokx |- X])
+         [--mokx |- X] | [--policy \fIpolicyfile\fR] | [--no-policy])
 .br
 \fBmokutil\fR [--revoke-import]
         ([--mokx | -X])
@@ -81,6 +84,8 @@ mokutil \- utility to manipulate machine owner keys
 .br
 \fBmokutil\fR [--timeout \fI-1,0..0x7fff\fR]
 .br
+\fBmokutil\fR [--policy-check \fIpolicyfile\fR]
+.br
 
 .SH DESCRIPTION
 \fBmokutil\fR is a tool to import or delete the machines owner keys
@@ -100,6 +105,12 @@ List the keys to be deleted
 \fB-i, --import\fR
 Collect the following files and form an enrolling request to shim. The files must
 be in DER format.
+.TP
+\fB--import-list \fImanifest\fR\fR
+Read DER key paths from \fImanifest\fR and form one enrolling request. Blank
+lines and lines beginning with \fB#\fR are ignored. Relative paths are resolved
+from the manifest directory. A directory entry expands to the regular files in
+that directory. The whole batch is validated before any request is written.
 .TP
 \fB-d, --delete\fR
 Collect the following files and form a deleting request to shim. The files must be
@@ -202,4 +213,95 @@ databases.
 .TP
 \fB--ignore-keyring\fR
 Ignore the kernel builtin trusted keys keyring check when enrolling a key into MokList
+.TP
+\fB--policy \fIpolicyfile\fR\fR
+Apply the import, delete, revoke, and reset policy in \fIpolicyfile\fR. If this
+option is omitted, \fBMOKUTIL_POLICY\fR is used when set, otherwise
+\fB/etc/mokutil/policy.conf\fR is used when it exists. Without any policy file,
+\fBmokutil\fR keeps its legacy behavior.
+.TP
+\fB--no-policy\fR
+Disable policy discovery for this invocation.
+.TP
+\fB--policy-check \fIpolicyfile\fR\fR
+Validate \fIpolicyfile\fR, print its effective rules, and exit. This does not
+access EFI variables.
+
+.SH POLICY FILE
+Policy files use one directive per line. Both \fBkey value\fR and
+\fBkey = value\fR forms are accepted. Lines beginning with \fB#\fR are
+comments. Unknown or duplicate scalar directives, malformed values, missing
+versions, and directly conflicting certificate rules are rejected.
+
+The required directive is:
+.TP
+\fBversion 1\fR
+Selects the only currently supported policy format.
+
+.PP
+Operation directives default to \fBdeny\fR when a policy is enabled:
+.TP
+\fBimport allow|deny\fR
+Allow or deny certificate import into MokNew or MokXNew.
+.TP
+\fBdelete allow|deny\fR
+Allow or deny certificate deletion requests.
+.TP
+\fBrevoke-import allow|deny\fR
+Allow or deny revocation of a pending import request.
+.TP
+\fBrevoke-delete allow|deny\fR
+Allow or deny revocation of a pending delete request.
+.TP
+\fBrevoke allow|deny\fR
+Shorthand that sets both revoke directives.
+.TP
+\fBreset allow|deny\fR
+Allow or deny reset of the complete MOK or MOKX request.
+
+.PP
+Additional directives:
+.TP
+\fBmax-batch \fInumber\fR\fR
+Limit the number of files in one import or delete batch. The range is 1 to 4096;
+the default is 64.
+.TP
+\fBrequire-ca yes|no\fR
+Require imported certificates to be CA certificates. The default is \fBno\fR.
+.TP
+\fBallow-path \fIpath\fR\fR
+Require key files to be below \fIpath\fR. The path must be absolute and must
+exist when the policy is loaded. The directive may be repeated.
+.TP
+\fBdeny-path \fIpath\fR\fR
+Reject key files below \fIpath\fR. Deny rules take precedence over allow rules.
+.TP
+\fBallow-sha256 \fIfingerprint\fR\fR
+Allow a certificate by the SHA-256 fingerprint of its DER encoding. When at
+least one allow rule is present, other certificates are denied. The directive
+may be repeated.
+.TP
+\fBdeny-sha256 \fIfingerprint\fR\fR
+Reject a certificate by its SHA-256 fingerprint. The directive may be repeated.
+
+.PP
+When certificate fingerprint rules are present, SHA-256 hash requests are
+checked against the same rules. Other hash lengths are rejected by the policy.
+
+.SH EXAMPLES
+.nf
+# /etc/mokutil/policy.conf
+version 1
+import allow
+delete allow
+revoke-import allow
+revoke-delete allow
+reset deny
+max-batch 8
+require-ca yes
+allow-path /etc/mok/keys
+
+mokutil --policy-check /etc/mokutil/policy.conf
+mokutil --policy /etc/mokutil/policy.conf --import-list /etc/mok/keys.list
+.fi
 .TP

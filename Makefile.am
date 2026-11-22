@@ -1,4 +1,4 @@
-SUBDIRS = src man
+SUBDIRS = src man tests
 
 if ENABLE_BASH_COMPLETION
   bashcompletiondir = $(BASH_COMPLETION_DIR)

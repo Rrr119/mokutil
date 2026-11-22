@@ -1,0 +1,17 @@
+{
+  "root": "/home/dev/feedback/uid32272",
+  "B": "/home/dev/feedback/uid32272",
+  "sha": "8828e577fdde684daf47c05e22ad74d668b9648a",
+  "wslDistro": "Ubuntu-26.04",
+  "source": {
+    "owner": "rhboot",
+    "repo": "mokutil",
+    "sha": "8828e577fdde684daf47c05e22ad74d668b9648a"
+  },
+  "fork": {
+    "owner": "Rrr119",
+    "repo": "mokutil",
+    "cloneUrl": "https://github.com/Rrr119/mokutil.git"
+  },
+  "at": "2026-11-22T04:45:03.510Z"
+}
